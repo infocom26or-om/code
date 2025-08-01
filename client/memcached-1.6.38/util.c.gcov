@@ -1,0 +1,282 @@
+        -:    0:Source:util.c
+        -:    0:Graph:util.gcno
+        -:    0:Data:util.gcda
+        -:    0:Runs:451
+        -:    1:#include <stdio.h>
+        -:    2:#include <assert.h>
+        -:    3:#include <ctype.h>
+        -:    4:#include <errno.h>
+        -:    5:#include <string.h>
+        -:    6:#include <stdlib.h>
+        -:    7:#include <stdarg.h>
+        -:    8:#include <sys/time.h>
+        -:    9:
+        -:   10:#include "util.h"
+        -:   11:
+        -:   12:static char *uriencode_map[256];
+        -:   13:static char uriencode_str[768];
+        -:   14:
+      121:   15:void uriencode_init(void) {
+      121:   16:    int x;
+      121:   17:    char *str = uriencode_str;
+    31097:   18:    for (x = 0; x < 256; x++) {
+    30976:   19:        if (isalnum(x) || x == '-' || x == '.' || x == '_' || x == '~') {
+     7986:   20:            uriencode_map[x] = NULL;
+        -:   21:        } else {
+    22990:   22:            snprintf(str, 4, "%%%02hhX", (unsigned char)x);
+    22990:   23:            uriencode_map[x] = str;
+    22990:   24:            str += 3; /* lobbing off the \0 is fine */
+        -:   25:        }
+        -:   26:    }
+      121:   27:}
+        -:   28:
+   151261:   29:bool uriencode(const char *src, char *dst, const size_t srclen, const size_t dstlen) {
+   151261:   30:    int x;
+   151261:   31:    size_t d = 0;
+ 15809164:   32:    for (x = 0; x < srclen; x++) {
+ 15657903:   33:        if (d + 4 > dstlen)
+        -:   34:            return false;
+ 15657903:   35:        if (uriencode_map[(unsigned char) src[x]] != NULL) {
+     1585:   36:            memcpy(&dst[d], uriencode_map[(unsigned char) src[x]], 3);
+     1585:   37:            d += 3;
+        -:   38:        } else {
+ 15656318:   39:            dst[d] = src[x];
+ 15656318:   40:            d++;
+        -:   41:        }
+        -:   42:    }
+   151261:   43:    dst[d] = '\0';
+   151261:   44:    return true;
+        -:   45:}
+        -:   46:
+        -:   47:/* Avoid warnings on solaris, where isspace() is an index into an array, and gcc uses signed chars */
+        -:   48:#define xisspace(c) isspace((unsigned char)c)
+        -:   49:
+      663:   50:bool safe_strtoull(const char *str, uint64_t *out) {
+     663*:   51:    assert(out != NULL);
+      663:   52:    errno = 0;
+      663:   53:    *out = 0;
+      663:   54:    char *endptr;
+      663:   55:    unsigned long long ull = strtoull(str, &endptr, 10);
+      663:   56:    if ((errno == ERANGE) || (str == endptr)) {
+        -:   57:        return false;
+        -:   58:    }
+        -:   59:
+      658:   60:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+      658:   61:        if ((long long) ull < 0) {
+        -:   62:            /* only check for negative signs in the uncommon case when
+        -:   63:             * the unsigned number is so big that it's negative as a
+        -:   64:             * signed number. */
+        6:   65:            if (memchr(str, '-', endptr - str) != NULL) {
+        -:   66:                return false;
+        -:   67:            }
+        -:   68:        }
+      658:   69:        *out = ull;
+      658:   70:        return true;
+        -:   71:    }
+        -:   72:    return false;
+        -:   73:}
+        -:   74:
+        -:   75:/* Could macro this. Decided to keep this unrolled for safety rather than add
+        -:   76: * the base parameter to all callers. Very few places need to parse a number
+        -:   77: * outside of base 10, currently exactly once, so splitting this up should
+        -:   78: * help avoid typo bugs.
+        -:   79: */
+        1:   80:bool safe_strtoull_hex(const char *str, uint64_t *out) {
+       1*:   81:    assert(out != NULL);
+        1:   82:    errno = 0;
+        1:   83:    *out = 0;
+        1:   84:    char *endptr;
+        1:   85:    unsigned long long ull = strtoull(str, &endptr, 16);
+        1:   86:    if ((errno == ERANGE) || (str == endptr)) {
+        -:   87:        return false;
+        -:   88:    }
+        -:   89:
+        1:   90:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+        1:   91:        if ((long long) ull < 0) {
+        -:   92:            /* only check for negative signs in the uncommon case when
+        -:   93:             * the unsigned number is so big that it's negative as a
+        -:   94:             * signed number. */
+    #####:   95:            if (memchr(str, '-', endptr - str) != NULL) {
+        -:   96:                return false;
+        -:   97:            }
+        -:   98:        }
+        1:   99:        *out = ull;
+        1:  100:        return true;
+        -:  101:    }
+        -:  102:    return false;
+        -:  103:}
+        -:  104:
+       11:  105:bool safe_strtoll(const char *str, int64_t *out) {
+      11*:  106:    assert(out != NULL);
+       11:  107:    errno = 0;
+       11:  108:    *out = 0;
+       11:  109:    char *endptr;
+       11:  110:    long long ll = strtoll(str, &endptr, 10);
+       11:  111:    if ((errno == ERANGE) || (str == endptr)) {
+        -:  112:        return false;
+        -:  113:    }
+        -:  114:
+       11:  115:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+       11:  116:        *out = ll;
+       11:  117:        return true;
+        -:  118:    }
+        -:  119:    return false;
+        -:  120:}
+        -:  121:
+   333403:  122:bool safe_strtoul(const char *str, uint32_t *out) {
+   333403:  123:    char *endptr = NULL;
+   333403:  124:    unsigned long l = 0;
+  333403*:  125:    assert(out);
+  333403*:  126:    assert(str);
+   333403:  127:    *out = 0;
+   333403:  128:    errno = 0;
+        -:  129:
+   333403:  130:    l = strtoul(str, &endptr, 10);
+   333403:  131:    if ((errno == ERANGE) || (str == endptr)) {
+        -:  132:        return false;
+        -:  133:    }
+        -:  134:
+   333400:  135:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+   333400:  136:        if ((long) l < 0) {
+        -:  137:            /* only check for negative signs in the uncommon case when
+        -:  138:             * the unsigned number is so big that it's negative as a
+        -:  139:             * signed number. */
+    #####:  140:            if (memchr(str, '-', endptr - str) != NULL) {
+        -:  141:                return false;
+        -:  142:            }
+        -:  143:        }
+   333400:  144:        *out = l;
+   333400:  145:        return true;
+        -:  146:    }
+        -:  147:
+        -:  148:    return false;
+        -:  149:}
+        -:  150:
+   672110:  151:bool safe_strtol(const char *str, int32_t *out) {
+  672110*:  152:    assert(out != NULL);
+   672110:  153:    errno = 0;
+   672110:  154:    *out = 0;
+   672110:  155:    char *endptr;
+   672110:  156:    long l = strtol(str, &endptr, 10);
+   672110:  157:    if ((errno == ERANGE) || (str == endptr)) {
+        -:  158:        return false;
+        -:  159:    }
+        -:  160:
+   672105:  161:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+   672105:  162:        *out = l;
+   672105:  163:        return true;
+        -:  164:    }
+        -:  165:    return false;
+        -:  166:}
+        -:  167:
+       13:  168:bool safe_strtod(const char *str, double *out) {
+      13*:  169:    assert(out != NULL);
+       13:  170:    errno = 0;
+       13:  171:    *out = 0;
+       13:  172:    char *endptr;
+       13:  173:    double d = strtod(str, &endptr);
+       13:  174:    if ((errno == ERANGE) || (str == endptr)) {
+        -:  175:        return false;
+        -:  176:    }
+        -:  177:
+       13:  178:    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+       13:  179:        *out = d;
+       13:  180:        return true;
+        -:  181:    }
+        -:  182:    return false;
+        -:  183:}
+        -:  184:
+        -:  185:// slow, safe function for copying null terminated buffers.
+        -:  186:// ensures null terminator set on destination buffer. copies at most dstmax-1
+        -:  187:// non-null bytes.
+        -:  188:// Explicitly avoids over-reading src while looking for the null byte.
+        -:  189:// returns true if src was fully copied.
+        -:  190:// returns false if src was truncated into dst.
+        2:  191:bool safe_strcpy(char *dst, const char *src, const size_t dstmax) {
+        2:  192:   size_t x;
+        -:  193:
+       10:  194:   for (x = 0; x < dstmax - 1 && src[x] != '\0'; x++) {
+        8:  195:        dst[x] = src[x];
+        -:  196:   }
+        -:  197:
+        2:  198:   dst[x] = '\0';
+        -:  199:
+        2:  200:   if (src[x] == '\0') {
+        -:  201:       return true;
+        -:  202:   } else {
+    #####:  203:       return false;
+        -:  204:   }
+        -:  205:}
+        -:  206:
+       10:  207:bool safe_memcmp(const void *a, const void *b, size_t len) {
+       10:  208:    const volatile unsigned char *ua = (const volatile unsigned char *)a;
+       10:  209:    const volatile unsigned char *ub = (const volatile unsigned char *)b;
+       10:  210:    int delta = 0;
+       10:  211:    size_t x;
+        -:  212:
+       43:  213:    for (x = 0; x < len; x++) {
+       33:  214:        delta |= ua[x] ^ ub[x];
+        -:  215:    }
+        -:  216:
+       10:  217:    if (delta == 0) {
+        -:  218:        return true;
+        -:  219:    } else {
+        2:  220:        return false;
+        -:  221:    }
+        -:  222:}
+        -:  223:
+        2:  224:void vperror(const char *fmt, ...) {
+        2:  225:    int old_errno = errno;
+        2:  226:    char buf[1024];
+        2:  227:    va_list ap;
+        -:  228:
+        2:  229:    va_start(ap, fmt);
+        2:  230:    if (vsnprintf(buf, sizeof(buf), fmt, ap) == -1) {
+    #####:  231:        buf[sizeof(buf) - 1] = '\0';
+        -:  232:    }
+        2:  233:    va_end(ap);
+        -:  234:
+        2:  235:    errno = old_errno;
+        -:  236:
+        2:  237:    perror(buf);
+        2:  238:}
+        -:  239:
+        -:  240:#ifndef HAVE_HTONLL
+    62326:  241:static uint64_t mc_swap64(uint64_t in) {
+        -:  242:#ifdef ENDIAN_LITTLE
+        -:  243:    /* Little endian, flip the bytes around until someone makes a faster/better
+        -:  244:    * way to do this. */
+    62326:  245:    int64_t rv = 0;
+    62326:  246:    int i = 0;
+   560934:  247:     for(i = 0; i<8; i++) {
+   498608:  248:        rv = (rv << 8) | (in & 0xff);
+   498608:  249:        in >>= 8;
+        -:  250:     }
+    62326:  251:    return rv;
+        -:  252:#else
+        -:  253:    /* big-endian machines don't need byte swapping */
+        -:  254:    return in;
+        -:  255:#endif
+        -:  256:}
+        -:  257:
+    40286:  258:uint64_t ntohll(uint64_t val) {
+    40286:  259:   return mc_swap64(val);
+        -:  260:}
+        -:  261:
+    22040:  262:uint64_t htonll(uint64_t val) {
+    22040:  263:   return mc_swap64(val);
+        -:  264:}
+        -:  265:#endif
+        -:  266:
+        -:  267:// adds ts2 to ts1
+        -:  268:#define NSEC_PER_SEC 1000000000
+     1281:  269:void mc_timespec_add(struct timespec *ts1,
+        -:  270:        struct timespec *ts2) {
+     1281:  271:    ts1->tv_sec += ts2->tv_sec;
+     1281:  272:    ts1->tv_nsec += ts2->tv_nsec;
+     1281:  273:    if (ts1->tv_nsec >= NSEC_PER_SEC) {
+      134:  274:        ts1->tv_sec++;
+      134:  275:        ts1->tv_nsec -= NSEC_PER_SEC;
+        -:  276:    }
+     1281:  277:}
+        -:  278:
