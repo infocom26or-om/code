@@ -31,7 +31,7 @@ If not yet installed, the **Jerasure** library is required for erasure coding an
 
 ## 2. Run
 ```bash
-cd ALRC_System
+cd ALRC_system
 mkdir -p build && cd build
 cmake ..
 make -j
