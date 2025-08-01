@@ -1,0 +1,773 @@
+        -:    0:Source:slabs_mover.c
+        -:    0:Graph:slabs_mover.gcno
+        -:    0:Data:slabs_mover.gcda
+        -:    0:Runs:451
+        -:    1:/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+        -:    2:#include "memcached.h"
+        -:    3:#include "slabs_mover.h"
+        -:    4:#include "slab_automove.h"
+        -:    5:#ifdef EXTSTORE
+        -:    6:#include "slab_automove_extstore.h"
+        -:    7:#endif
+        -:    8:#include "storage.h"
+        -:    9:#include <sys/mman.h>
+        -:   10:#include <sys/stat.h>
+        -:   11:#include <sys/socket.h>
+        -:   12:#include <sys/resource.h>
+        -:   13:#include <fcntl.h>
+        -:   14:#include <netinet/in.h>
+        -:   15:#include <stdlib.h>
+        -:   16:#include <stdio.h>
+        -:   17:#include <string.h>
+        -:   18:#include <assert.h>
+        -:   19:#include <pthread.h>
+        -:   20:
+        -:   21:struct slab_rebalance {
+        -:   22:    void *slab_start;
+        -:   23:    void *slab_end;
+        -:   24:    void *slab_pos;
+        -:   25:    unsigned int s_clsid;
+        -:   26:    unsigned int d_clsid;
+        -:   27:    uint32_t cls_size;
+        -:   28:    uint32_t busy_items;
+        -:   29:    uint32_t rescues;
+        -:   30:    uint32_t inline_reclaim;
+        -:   31:    uint32_t chunk_rescues;
+        -:   32:    uint32_t busy_nomem;
+        -:   33:    uint32_t busy_deletes;
+        -:   34:    uint32_t busy_loops;
+        -:   35:    uint8_t done;
+        -:   36:    uint8_t *completed;
+        -:   37:};
+        -:   38:
+        -:   39:struct slab_rebal_thread {
+        -:   40:    bool run_thread;
+        -:   41:    bool allow_evictions; // global pool empty or manual page move
+        -:   42:    void *storage; // extstore instance.
+        -:   43:    item *new_it; // memory for swapping out valid items.
+        -:   44:    // TODO: logger instance.
+        -:   45:    pthread_mutex_t lock;
+        -:   46:    pthread_cond_t cond;
+        -:   47:    pthread_t tid;
+        -:   48:    logger *l;
+        -:   49:    unsigned int am_version; // re-generate am object if version changes
+        -:   50:    struct timespec am_last; // last time automover algo ran
+        -:   51:    slab_automove_reg_t *sam; // active algorithm module
+        -:   52:    void *active_am; // automover memory
+        -:   53:    struct slab_rebalance rebal;
+        -:   54:};
+        -:   55:
+        -:   56:enum move_status {
+        -:   57:    MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY,
+        -:   58:    MOVE_BUSY_UPLOADING, MOVE_BUSY_ACTIVE, MOVE_BUSY_FLOATING, MOVE_LOCKED
+        -:   59:};
+        -:   60:
+        -:   61:static slab_automove_reg_t slab_automove_default = {
+        -:   62:    .init = slab_automove_init,
+        -:   63:    .free = slab_automove_free,
+        -:   64:    .run = slab_automove_run
+        -:   65:};
+        -:   66:#ifdef EXTSTORE
+        -:   67:static slab_automove_reg_t slab_automove_extstore = {
+        -:   68:    .init = slab_automove_extstore_init,
+        -:   69:    .free = slab_automove_extstore_free,
+        -:   70:    .run = slab_automove_extstore_run
+        -:   71:};
+        -:   72:#endif
+        -:   73:
+        -:   74:// the sleep inbetween loops is short, so 1000 loops is < 1s
+        -:   75:#define SLAB_MOVE_MAX_LOOPS 5000
+        -:   76:static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags);
+        -:   77:
+      259:   78:static int slab_rebalance_start(struct slab_rebal_thread *t) {
+      259:   79:    uint32_t size;
+      259:   80:    uint32_t perslab;
+      259:   81:    bool mem_limit_reached;
+        -:   82:
+      259:   83:    if (t->rebal.s_clsid == t->rebal.d_clsid) {
+        -:   84:        return -1;
+        -:   85:    }
+        -:   86:
+        -:   87:    // check once at the start of a page move if the global pool is full.
+        -:   88:    // since we're the only thing that can put memory back into the global
+        -:   89:    // pool, this can't change until we complete.
+        -:   90:    // unless the user changes the memory limit manually, which should be
+        -:   91:    // rare.
+      259:   92:    unsigned int global = global_page_pool_size(&mem_limit_reached);
+      259:   93:    if (mem_limit_reached && global == 0) {
+       23:   94:        t->allow_evictions = true;
+        -:   95:    }
+        -:   96:
+      259:   97:    void *page = slabs_peek_page(t->rebal.s_clsid, &size, &perslab);
+        -:   98:
+        -:   99:    // Bit-vector to keep track of completed chunks
+      259:  100:    t->rebal.completed = (uint8_t*)calloc(perslab,sizeof(uint8_t));
+      259:  101:    if (!t->rebal.completed) {
+        -:  102:        return -1;
+        -:  103:    }
+        -:  104:
+        -:  105:    /* Always kill the first available slab page as it is most likely to
+        -:  106:     * contain the oldest items
+        -:  107:     */
+      259:  108:    t->rebal.slab_start = t->rebal.slab_pos = page;
+      259:  109:    t->rebal.slab_end   = (char *)page + (size * perslab);
+      259:  110:    t->rebal.done       = 0;
+      259:  111:    t->rebal.cls_size   = size;
+        -:  112:    // Don't need to do chunk move work if page is in global pool.
+      259:  113:    if (t->rebal.s_clsid == SLAB_GLOBAL_PAGE_POOL) {
+       46:  114:        t->rebal.done = 1;
+        -:  115:    }
+        -:  116:
+        -:  117:    // FIXME: remove this. query the structure from outside to see if we're
+        -:  118:    // running.
+      259:  119:    STATS_LOCK();
+      259:  120:    stats_state.slab_reassign_running = true;
+      259:  121:    STATS_UNLOCK();
+        -:  122:
+      259:  123:    return 0;
+        -:  124:}
+        -:  125:
+     6774:  126:static void *slab_rebalance_alloc(struct slab_rebal_thread *t, unsigned int id) {
+     6774:  127:    item *new_it = NULL;
+        -:  128:
+        -:  129:    // We will either wipe the whole page if unused, or run out of memory in
+        -:  130:    // the page and return NULL.
+    21308:  131:    while (1) {
+    14041:  132:        new_it = slabs_alloc(id, SLABS_ALLOC_NO_NEWPAGE);
+    14041:  133:        if (new_it == NULL) {
+        -:  134:            break;
+        -:  135:        }
+        -:  136:        /* check that memory isn't within the range to clear */
+    11027:  137:        if ((void *)new_it >= t->rebal.slab_start
+     8901:  138:            && (void *)new_it < t->rebal.slab_end) {
+        -:  139:            /* Pulled something we intend to free. Mark it as freed since
+        -:  140:             * we've already done the work of unlinking it from the freelist.
+        -:  141:             */
+     7267:  142:            new_it->refcount = 0;
+     7267:  143:            new_it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        -:  144:#ifdef DEBUG_SLAB_MOVER
+        -:  145:            memcpy(ITEM_key(new_it), "deadbeef", 8);
+        -:  146:#endif
+     7267:  147:            new_it = NULL;
+     7267:  148:            t->rebal.inline_reclaim++;
+        -:  149:        } else {
+        -:  150:            break;
+        -:  151:        }
+        -:  152:    }
+     6774:  153:    return new_it;
+        -:  154:}
+        -:  155:
+        -:  156:// To call move, we first need a free chunk of memory.
+   220098:  157:static void slab_rebalance_prep(struct slab_rebal_thread *t) {
+   220098:  158:    unsigned int s_clsid = t->rebal.s_clsid;
+   220098:  159:    if (t->new_it) {
+        -:  160:        // move didn't use the memory from the last loop.
+        -:  161:        return;
+        -:  162:    }
+        -:  163:
+     3935:  164:    t->new_it = slab_rebalance_alloc(t, s_clsid);
+        -:  165:    // we could free the entire page in the above alloc call, but not get any
+        -:  166:    // other memory to work with.
+        -:  167:    // We try to busy-loop the page mover at least a few times in this case,
+        -:  168:    // so it will pick up on all of the memory being freed already.
+     3935:  169:    if (t->new_it == NULL && t->allow_evictions) {
+        -:  170:        // global is empty and memory limit is reached. we have to evict
+        -:  171:        // memory to move forward.
+     3014:  172:        for (int x = 0; x < 10; x++) {
+     2839:  173:            if (lru_pull_tail(s_clsid, COLD_LRU, 0, LRU_PULL_EVICT, 0, NULL) <= 0) {
+    #####:  174:                if (settings.lru_segmented) {
+    #####:  175:                    lru_pull_tail(s_clsid, HOT_LRU, 0, 0, 0, NULL);
+        -:  176:                }
+        -:  177:            }
+     2839:  178:            t->new_it = slab_rebalance_alloc(t, s_clsid);
+     2839:  179:            if (t->new_it != NULL) {
+        -:  180:                break;
+        -:  181:            }
+        -:  182:        }
+        -:  183:    }
+        -:  184:}
+        -:  185:
+        -:  186:/* refcount == 0 is safe since nobody can incr while item_lock is held.
+        -:  187: * refcount != 0 is impossible since flags/etc can be modified in other
+        -:  188: * threads. instead, note we found a busy one and bail.
+        -:  189: * NOTE: This is checking it_flags outside of an item lock. I believe this
+        -:  190: * works since it_flags is 8 bits, and we're only ever comparing a single bit
+        -:  191: * regardless. ITEM_SLABBED bit will always be correct since we're holding the
+        -:  192: * lock which modifies that bit. ITEM_LINKED won't exist if we're between an
+        -:  193: * item having ITEM_SLABBED removed, and the key hasn't been added to the item
+        -:  194: * yet. The memory barrier from the slabs lock should order the key write and the
+        -:  195: * flags to the item?
+        -:  196: * If ITEM_LINKED did exist and was just removed, but we still see it, that's
+        -:  197: * still safe since it will have a valid key, which we then lock, and then
+        -:  198: * recheck everything.
+        -:  199: * This may not be safe on all platforms; If not, slabs_alloc() will need to
+        -:  200: * seed the item key while holding slabs_lock.
+        -:  201: */
+        -:  202:
+        -:  203:struct _locked_st {
+        -:  204:    item *it;
+        -:  205:    item_chunk *ch;
+        -:  206:    void *hold_lock; // held lock from trylock.
+        -:  207:    uint32_t hv;
+        -:  208:    unsigned int s_clsid;
+        -:  209:    unsigned int d_clsid;
+        -:  210:};
+        -:  211:
+        -:  212:// called while slabs lock is held so we can safely inspect a chunk of memory
+        -:  213:// and do an inverted item lock.
+   159722:  214:static int _slabs_locked_cb(void *arg) {
+   159722:  215:    struct _locked_st *a = arg;
+   159722:  216:    int status = MOVE_PASS;
+   159722:  217:    item *it = a->it;
+        -:  218:
+   159722:  219:    if (it->it_flags & ITEM_CHUNK) {
+        -:  220:        /* This chunk is a chained part of a larger item. */
+     1101:  221:        a->ch = (item_chunk *) it;
+        -:  222:        /* Instead, we use the head chunk to find the item and effectively
+        -:  223:         * lock the entire structure. If a chunk has ITEM_CHUNK flag, its
+        -:  224:         * head cannot be slabbed, so the normal routine is safe. */
+     1101:  225:        it = a->ch->head;
+    1101*:  226:        assert(it->it_flags & ITEM_CHUNKED);
+        -:  227:    }
+        -:  228:
+        -:  229:    /* ITEM_FETCHED when ITEM_SLABBED is overloaded to mean we've cleared
+        -:  230:     * the chunk for move. Only these two flags should exist.
+        -:  231:     */
+        -:  232:    // TODO: bad failure mode if MOVE_PASS and we decide to skip later
+        -:  233:    // but the item is actually alive for whatever reason.
+        -:  234:    // default to MOVE_BUSY and set MOVE_PASS explicitly if the item is S|F?
+   159722:  235:    if (it->it_flags != (ITEM_SLABBED|ITEM_FETCHED)) {
+   152455:  236:        int refcount = 0;
+        -:  237:
+        -:  238:        /* ITEM_SLABBED can only be added/removed under the slabs_lock */
+   152455:  239:        if (it->it_flags & ITEM_SLABBED) {
+  147416*:  240:            assert(a->ch == NULL);
+        -:  241:            // must unlink our free item while slab lock held.
+        -:  242:            // since we don't have an item lock to cover us.
+   147416:  243:            do_slabs_unlink_free_chunk(a->s_clsid, it);
+   147416:  244:            it->it_flags = 0; // fix flags outside of the slab lock.
+   147416:  245:            status = MOVE_FROM_SLAB;
+     5039:  246:        } else if ((it->it_flags & ITEM_LINKED) != 0) {
+        -:  247:            /* If it doesn't have ITEM_SLABBED, the item could be in any
+        -:  248:             * state on its way to being freed or written to. If no
+        -:  249:             * ITEM_SLABBED, but it's had ITEM_LINKED, it must be active
+        -:  250:             * and have the key written to it already.
+        -:  251:             */
+     4392:  252:            a->hv = hash(ITEM_key(it), it->nkey);
+     4392:  253:            if ((a->hold_lock = item_trylock(a->hv)) == NULL) {
+        -:  254:                status = MOVE_LOCKED;
+        -:  255:            } else {
+     3772:  256:                bool is_linked = (it->it_flags & ITEM_LINKED);
+     3772:  257:                refcount = refcount_incr(it);
+     3772:  258:                if (refcount == 2) { /* item is linked but not busy */
+        -:  259:                    /* Double check ITEM_LINKED flag here, since we're
+        -:  260:                     * past a memory barrier from the mutex. */
+     3699:  261:                    if (is_linked) {
+        -:  262:                        status = MOVE_FROM_LRU;
+        -:  263:                    } else {
+        -:  264:                        /* refcount == 1 + !ITEM_LINKED means the item is being
+        -:  265:                         * uploaded to, or was just unlinked but hasn't been freed
+        -:  266:                         * yet. Let it bleed off on its own and try again later */
+    #####:  267:                        status = MOVE_BUSY_UPLOADING;
+        -:  268:                    }
+       73:  269:                } else if (refcount > 2 && is_linked) {
+        -:  270:                    status = MOVE_BUSY_ACTIVE;
+        -:  271:                } else {
+    #####:  272:                    status = MOVE_BUSY;
+        -:  273:                }
+        -:  274:            }
+        -:  275:        } else {
+        -:  276:            /* See above comment. No ITEM_SLABBED or ITEM_LINKED. Mark
+        -:  277:             * busy and wait for item to complete its upload. */
+        -:  278:            status = MOVE_BUSY_FLOATING;
+        -:  279:        }
+        -:  280:    }
+        -:  281:
+   159722:  282:    return status;
+        -:  283:}
+        -:  284:
+     3544:  285:static void slab_rebalance_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
+     3544:  286:    int cls_size = t->rebal.cls_size;
+     3544:  287:    item *it = a->it;
+     3544:  288:    item_chunk *ch = a->ch;
+     3544:  289:    item *new_it = t->new_it;
+        -:  290:
+     3544:  291:    if (ch == NULL) {
+    2446*:  292:        assert((new_it->it_flags & ITEM_CHUNKED) == 0);
+        -:  293:        /* if free memory, memcpy. clear prev/next/h_bucket */
+     2446:  294:        memcpy(new_it, it, cls_size);
+     2446:  295:        new_it->prev = 0;
+     2446:  296:        new_it->next = 0;
+     2446:  297:        new_it->h_next = 0;
+        -:  298:        /* These are definitely required. else fails assert */
+     2446:  299:        new_it->it_flags &= ~ITEM_LINKED;
+     2446:  300:        new_it->refcount = 0;
+     2446:  301:        do_item_replace(it, new_it, a->hv, ITEM_get_cas(it));
+        -:  302:        /* Need to walk the chunks and repoint head  */
+     2446:  303:        if (new_it->it_flags & ITEM_CHUNKED) {
+    #####:  304:            item_chunk *fch = (item_chunk *) ITEM_schunk(new_it);
+    #####:  305:            fch->next->prev = fch;
+    #####:  306:            while (fch) {
+    #####:  307:                fch->head = new_it;
+    #####:  308:                fch = fch->next;
+        -:  309:            }
+        -:  310:        }
+     2446:  311:        it->refcount = 0;
+     2446:  312:        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        -:  313:#ifdef DEBUG_SLAB_MOVER
+        -:  314:        memcpy(ITEM_key(it), "deadbeef", 8);
+        -:  315:#endif
+     2446:  316:        t->rebal.rescues++;
+        -:  317:    } else {
+     1098:  318:        item_chunk *nch = (item_chunk *) new_it;
+        -:  319:        /* Chunks always have head chunk (the main it) */
+     1098:  320:        ch->prev->next = nch;
+     1098:  321:        if (ch->next)
+      643:  322:            ch->next->prev = nch;
+     1098:  323:        memcpy(nch, ch, ch->used + sizeof(item_chunk));
+     1098:  324:        ch->refcount = 0;
+     1098:  325:        ch->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+     1098:  326:        t->rebal.chunk_rescues++;
+        -:  327:#ifdef DEBUG_SLAB_MOVER
+        -:  328:        memcpy(ITEM_key((item *)ch), "deadbeef", 8);
+        -:  329:#endif
+     1098:  330:        refcount_decr(it);
+        -:  331:    }
+        -:  332:
+        -:  333:    // we've used the temporary memory.
+     3544:  334:    t->new_it = NULL;
+     3544:  335:}
+        -:  336:
+        -:  337:// TODO: in order to rescue active chunked items we need to first do more work
+        -:  338:// on chunked items:
+        -:  339:// - individual chunks need to be refcounted, with refcounts protected by item
+        -:  340:// lock. then they can be swapped out an released on refcount reduction
+        -:  341:// - for chunked item headers I don't know how off-hand.
+       46:  342:static int slab_rebalance_active_rescue(struct slab_rebal_thread *t, struct _locked_st *a) {
+       46:  343:    int cls_size = t->rebal.cls_size;
+       46:  344:    item *it = a->it;
+       46:  345:    item_chunk *ch = a->ch;
+       46:  346:    item *new_it = t->new_it;
+        -:  347:
+        -:  348:    // Can only rescue active non-chunked items right now.
+       46:  349:    if (ch == NULL && (it->it_flags & ITEM_CHUNKED) == 0) {
+       46:  350:        memcpy(new_it, it, cls_size);
+       46:  351:        new_it->prev = 0;
+       46:  352:        new_it->next = 0;
+       46:  353:        new_it->h_next = 0;
+        -:  354:
+       46:  355:        new_it->it_flags &= ~ITEM_LINKED;
+       46:  356:        new_it->refcount = 0;
+       46:  357:        do_item_replace(it, new_it, a->hv, ITEM_get_cas(it));
+       46:  358:        t->rebal.rescues++;
+        -:  359:
+        -:  360:        // old it is now unlinked. can't immediately rescue item.
+       46:  361:        t->new_it = NULL;
+       46:  362:        return 0;
+        -:  363:    } else {
+        -:  364:        // else if chunked, check if we've been busy-waiting too long and
+        -:  365:        // delete the item.
+    #####:  366:        if (t->rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
+        -:  367:            // TODO: add indicator for source of eviction
+    #####:  368:            LOGGER_LOG(t->l, LOG_EVICTIONS, LOGGER_EVICTION, it);
+    #####:  369:            STORAGE_delete(t->storage, it);
+    #####:  370:            do_item_unlink(it, a->hv);
+    #####:  371:            t->rebal.busy_deletes++;
+        -:  372:        }
+        -:  373:    }
+        -:  374:
+        -:  375:    // failed to rescue busy item.
+        -:  376:    return 1;
+        -:  377:}
+        -:  378:
+        -:  379:// try to free up a chunk of memory, if not already free.
+        -:  380:// if we have memory available outside of the source page, rescue any valid
+        -:  381:// items.
+        -:  382:// we still attempt to move data even if no memory is available for a rescue,
+        -:  383:// in case the item is already free, expired, busy, etc.
+   220098:  384:static int slab_rebalance_move(struct slab_rebal_thread *t) {
+   220098:  385:    uint32_t was_busy = t->rebal.busy_items;
+   220098:  386:    struct _locked_st cbarg;
+   220098:  387:    memset(&cbarg, 0, sizeof(cbarg));
+        -:  388:
+        -:  389:    // the offset to check if completed or not
+   220098:  390:    int offset = ((char*)t->rebal.slab_pos-(char*)t->rebal.slab_start)/(t->rebal.cls_size);
+        -:  391:
+        -:  392:    // skip acquiring the slabs lock for items we've already fully processed.
+   220098:  393:    if (t->rebal.completed[offset] == 0) {
+   159722:  394:        item *it;
+   159722:  395:        cbarg.it = it = t->rebal.slab_pos;
+   159722:  396:        cbarg.s_clsid = t->rebal.s_clsid;
+   159722:  397:        cbarg.d_clsid = t->rebal.d_clsid;
+        -:  398:        // it is returned _locked_ if successful. _must_ unlock it!
+   159722:  399:        int status = slabs_locked_callback(_slabs_locked_cb, &cbarg);
+        -:  400:
+   159722:  401:        item_chunk *ch = cbarg.ch;
+   159722:  402:        if (ch) {
+        -:  403:            // swap item under examination to the chunk head if we're
+        -:  404:            // attempting to move a chunk within a larger item.
+     1101:  405:            cbarg.it = it = ch->head;
+        -:  406:        }
+   159722:  407:        switch (status) {
+     3772:  408:            case MOVE_BUSY_ACTIVE:
+        -:  409:            case MOVE_FROM_LRU:
+        -:  410:                /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
+        -:  411:                 * We only need to hold the slabs_lock while initially looking
+        -:  412:                 * at an item, and at this point we have an exclusive refcount
+        -:  413:                 * (2) + the item is locked. Drop slabs lock, drop item to
+        -:  414:                 * refcount 1 (just our own, then fall through and wipe it
+        -:  415:                 */
+        -:  416:                /* Check if expired or flushed */
+     3772:  417:                if ((it->exptime != 0 && it->exptime < current_time)
+     3733:  418:                    || item_is_flushed(it)) {
+        -:  419:                    /* Expired, don't save. */
+       39:  420:                    STORAGE_delete(t->storage, it);
+       39:  421:                    if (!ch && (it->it_flags & ITEM_CHUNKED) == 0) {
+       39:  422:                        do_item_unlink(it, cbarg.hv);
+       39:  423:                        if (it->refcount == 1) {
+       12:  424:                            it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+       12:  425:                            it->refcount = 0;
+        -:  426:#ifdef DEBUG_SLAB_MOVER
+        -:  427:                            memcpy(ITEM_key(it), "deadbeef", 8);
+        -:  428:#endif
+       12:  429:                            t->rebal.completed[offset] = 1;
+        -:  430:                        } else {
+        -:  431:                            // expired, but busy.
+       27:  432:                            do_item_remove(it);
+       27:  433:                            t->rebal.busy_items++;
+        -:  434:                        }
+        -:  435:                    } else {
+        -:  436:                        // chunked: unlink it and grab on next loop
+        -:  437:                        // same code regardless of refcount
+    #####:  438:                        do_item_unlink(it, cbarg.hv);
+    #####:  439:                        do_item_remove(it);
+    #####:  440:                        t->rebal.busy_items++;
+        -:  441:                    }
+        -:  442:                } else {
+        -:  443:                    // we should try to rescue the item.
+     3733:  444:                    if (t->new_it == NULL) {
+        -:  445:                        // we don't actually have memory: need to mark as busy
+        -:  446:                        // and try again in a future loop.
+      143:  447:                        t->rebal.busy_items++;
+      143:  448:                        t->rebal.busy_nomem++;
+      143:  449:                        refcount_decr(it);
+        -:  450:                    } else {
+     3590:  451:                        if (it->refcount == 2) {
+     3544:  452:                            slab_rebalance_rescue(t, &cbarg);
+     3544:  453:                            t->rebal.completed[offset] = 1;
+        -:  454:                        } else {
+      46*:  455:                            assert(it->refcount > 2);
+        -:  456:                            // need to wait for ref'ed owners to free *it
+       46:  457:                            slab_rebalance_active_rescue(t, &cbarg);
+       46:  458:                            t->rebal.busy_items++;
+       46:  459:                            do_item_remove(it);
+        -:  460:                        }
+        -:  461:                    }
+        -:  462:                }
+        -:  463:
+     3772:  464:                item_trylock_unlock(cbarg.hold_lock);
+     3772:  465:                break;
+   147416:  466:            case MOVE_FROM_SLAB:
+   147416:  467:                it->refcount = 0;
+   147416:  468:                it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        -:  469:#ifdef DEBUG_SLAB_MOVER
+        -:  470:                memcpy(ITEM_key(it), "deadbeef", 8);
+        -:  471:#endif
+   147416:  472:                t->rebal.completed[offset] = 1;
+   147416:  473:                break;
+    #####:  474:            case MOVE_BUSY:
+        -:  475:            case MOVE_BUSY_UPLOADING:
+    #####:  476:                assert(it->refcount != 0);
+    #####:  477:                t->rebal.busy_items++;
+    #####:  478:                refcount_decr(it);
+    #####:  479:                item_trylock_unlock(cbarg.hold_lock);
+    #####:  480:                break;
+     1267:  481:            case MOVE_LOCKED:
+        -:  482:            case MOVE_BUSY_FLOATING:
+     1267:  483:                t->rebal.busy_items++;
+     1267:  484:                break;
+     7267:  485:            case MOVE_PASS:
+        -:  486:                // already freed and unlinked, probably during an alloc
+     7267:  487:                t->rebal.completed[offset] = 1;
+     7267:  488:                break;
+        -:  489:        }
+        -:  490:
+        -:  491:    }
+        -:  492:
+   220098:  493:    t->rebal.slab_pos = (char *)t->rebal.slab_pos + t->rebal.cls_size;
+        -:  494:
+   220098:  495:    if (t->rebal.slab_pos >= t->rebal.slab_end) {
+        -:  496:        /* Some items were busy, start again from the top */
+      868:  497:        if (t->rebal.busy_items) {
+      656:  498:            t->rebal.slab_pos = t->rebal.slab_start;
+      656:  499:            STATS_LOCK();
+      656:  500:            stats.slab_reassign_busy_items += t->rebal.busy_items;
+      656:  501:            STATS_UNLOCK();
+      656:  502:            t->rebal.busy_items = 0;
+      656:  503:            t->rebal.busy_loops++;
+        -:  504:        } else {
+      212:  505:            t->rebal.done++;
+        -:  506:        }
+        -:  507:    }
+        -:  508:
+   220098:  509:    return (t->rebal.busy_items != was_busy) ? 1 : 0;
+        -:  510:}
+        -:  511:
+      258:  512:static void slab_rebalance_finish(struct slab_rebal_thread *t) {
+        -:  513:#ifdef DEBUG_SLAB_MOVER
+        -:  514:    /* If the algorithm is broken, live items can sneak in. */
+        -:  515:    slab_rebal.slab_pos = slab_rebal.slab_start;
+        -:  516:    while (1) {
+        -:  517:        item *it = slab_rebal.slab_pos;
+        -:  518:        assert(it->it_flags == (ITEM_SLABBED|ITEM_FETCHED));
+        -:  519:        assert(memcmp(ITEM_key(it), "deadbeef", 8) == 0);
+        -:  520:        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        -:  521:        slab_rebal.slab_pos = (char *)slab_rebal.slab_pos + slab_rebal.cls_size;
+        -:  522:        if (slab_rebal.slab_pos >= slab_rebal.slab_end)
+        -:  523:            break;
+        -:  524:    }
+        -:  525:#endif
+        -:  526:
+        -:  527:    // release any temporary memory we didn't end up using.
+      258:  528:    if (t->new_it) {
+      169:  529:        slabs_free(t->new_it, t->rebal.s_clsid);
+      169:  530:        t->new_it = NULL;
+        -:  531:    }
+        -:  532:
+        -:  533:    /* At this point the stolen slab is completely clear.
+        -:  534:     * We always kill the "first"/"oldest" slab page in the slab_list, so
+        -:  535:     * shuffle the page list backwards and decrement.
+        -:  536:     */
+      258:  537:    slabs_finalize_page_move(t->rebal.s_clsid, t->rebal.d_clsid,
+        -:  538:            t->rebal.slab_start);
+        -:  539:
+      258:  540:    STATS_LOCK();
+      258:  541:    stats.slabs_moved++;
+      258:  542:    stats.slab_reassign_rescues += t->rebal.rescues;
+      258:  543:    stats.slab_reassign_inline_reclaim += t->rebal.inline_reclaim;
+      258:  544:    stats.slab_reassign_chunk_rescues += t->rebal.chunk_rescues;
+      258:  545:    stats.slab_reassign_busy_deletes += t->rebal.busy_deletes;
+      258:  546:    stats.slab_reassign_busy_nomem += t->rebal.busy_nomem;
+      258:  547:    stats_state.slab_reassign_running = false;
+      258:  548:    STATS_UNLOCK();
+        -:  549:
+      258:  550:    free(t->rebal.completed);
+      258:  551:    memset(&t->rebal, 0, sizeof(t->rebal));
+      258:  552:    t->allow_evictions = false;
+      258:  553:}
+        -:  554:
+     1737:  555:static int slab_rebalance_check_automove(struct slab_rebal_thread *t,
+        -:  556:        struct timespec *now) {
+     1737:  557:    int src, dst;
+     1737:  558:    if (settings.slab_automove == 0) {
+        -:  559:        // not enabled
+        -:  560:        return 0;
+        -:  561:    }
+        -:  562:
+     1476:  563:    if (t->am_last.tv_sec == now->tv_sec) {
+        -:  564:        // run once per second-ish.
+        -:  565:        return 0;
+        -:  566:    }
+        -:  567:
+     1471:  568:    if (settings.slab_automove_version != t->am_version) {
+    #####:  569:        void *am_new = t->sam->init(&settings);
+        -:  570:        // only replace if we successfully re-init'ed
+    #####:  571:        if (am_new) {
+    #####:  572:            t->sam->free(t->active_am);
+    #####:  573:            t->active_am = am_new;
+        -:  574:        }
+    #####:  575:        t->am_version = settings.slab_automove_version;
+        -:  576:    }
+        -:  577:
+     1471:  578:    t->sam->run(t->active_am, &src, &dst);
+     1469:  579:    if (src != -1 && dst != -1) {
+        -:  580:        // rebalancer lock already held, call directly.
+      150:  581:        const char *msg = "ok";
+      150:  582:        if (do_slabs_reassign(t, src, dst, 0) != REASSIGN_OK) {
+    #####:  583:            msg = "fail";
+        -:  584:        }
+     150*:  585:        LOGGER_LOG(t->l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst, msg);
+      150:  586:        if (dst != 0) {
+        -:  587:            // if not reclaiming to global, rate limit to one per second.
+        1:  588:            t->am_last.tv_sec = now->tv_sec;
+        -:  589:        }
+        -:  590:        // run the thread since we're moving a page.
+      150:  591:        return 1;
+        -:  592:    }
+        -:  593:
+        -:  594:    return 0;
+        -:  595:}
+        -:  596:
+        -:  597:/* Slab mover thread.
+        -:  598: * Sits waiting for a condition to jump off and shovel some memory about
+        -:  599: */
+        -:  600:// TODO: add back the "max busy loops" and bail the page move
+      115:  601:static void *slab_rebalance_thread(void *arg) {
+      115:  602:    struct slab_rebal_thread *t = arg;
+      115:  603:    struct slab_rebalance *r = &t->rebal;
+      115:  604:    int backoff_timer = 1;
+      115:  605:    int backoff_max = 1000;
+      115:  606:    int algo_backoff = 0;
+        -:  607:    // create logger in thread for setspecific
+      115:  608:    t->l = logger_create();
+        -:  609:    /* Go into cond_wait with the mutex held */
+      115:  610:    mutex_lock(&t->lock);
+        -:  611:
+        -:  612:    /* Must finish moving page before stopping */
+   222095:  613:    while (t->run_thread) {
+        -:  614:        // are we running a rebalance?
+   222093:  615:        if (r->s_clsid != 0 || r->d_clsid != 0) {
+        -:  616:            // do we need to kick it off?
+   220356:  617:            if (r->slab_start == NULL) {
+     259*:  618:                if (slab_rebalance_start(t) < 0) {
+    #####:  619:                    r->s_clsid = 0;
+    #####:  620:                    r->d_clsid = 0;
+    #####:  621:                    continue;
+        -:  622:                }
+        -:  623:            }
+        -:  624:
+   220356:  625:            if (r->done) {
+      258:  626:                slab_rebalance_finish(t);
+        -:  627:            } else {
+        -:  628:                // attempt to get some prepared memory
+   220098:  629:                slab_rebalance_prep(t);
+        -:  630:                // attempt to free up memory in a page
+   220098:  631:                if (slab_rebalance_move(t)) {
+        -:  632:                    /* Stuck waiting for some items to unlock, so slow down a bit
+        -:  633:                     * to give them a chance to free up */
+     2132:  634:                    usleep(backoff_timer);
+     2131:  635:                    backoff_timer = backoff_timer * 2;
+     2131:  636:                    if (backoff_timer > backoff_max)
+        -:  637:                        backoff_timer = backoff_max;
+        -:  638:                } else {
+        -:  639:                    backoff_timer = 1;
+        -:  640:                }
+        -:  641:            }
+        -:  642:        } else {
+     1737:  643:            struct timespec now;
+     1737:  644:            clock_gettime(CLOCK_REALTIME, &now);
+     1737:  645:            if (slab_rebalance_check_automove(t, &now) == 0) {
+     1585:  646:                struct timespec next = { .tv_sec = 0, .tv_nsec = 100000000 };
+     1585:  647:                if (algo_backoff++ > 10) {
+        -:  648:                    // start sleeping once per second since we've gone at
+        -:  649:                    // least a second without doing anything.
+      312:  650:                    now.tv_sec++;
+        -:  651:                } else {
+        -:  652:                    // else do a shorter sleep to be more responsive.
+     1273:  653:                    mc_timespec_add(&now, &next);
+        -:  654:                }
+        -:  655:                // standard delay
+        -:  656:                // wait for signal to start another move.
+     1585:  657:                pthread_cond_timedwait(&t->cond, &t->lock, &now);
+        -:  658:            } else { // else don't wait, run again immediately.
+        -:  659:                algo_backoff = 0;
+        -:  660:            }
+        -:  661:        }
+        -:  662:    }
+        -:  663:
+        -:  664:    // TODO: cancel in-flight slab page move
+        2:  665:    mutex_unlock(&t->lock);
+        2:  666:    return NULL;
+        -:  667:}
+        -:  668:
+      269:  669:static enum reassign_result_type do_slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags) {
+      269:  670:    if (src == dst)
+        -:  671:        return REASSIGN_SRC_DST_SAME;
+        -:  672:
+        -:  673:    /* Special indicator to choose ourselves. */
+      268:  674:    if (src == -1) {
+    #####:  675:        src = slabs_pick_any_for_reassign(dst);
+        -:  676:        /* TODO: If we end up back at -1, return a new error type */
+        -:  677:    }
+        -:  678:
+      268:  679:    if (src < SLAB_GLOBAL_PAGE_POOL || src > MAX_NUMBER_OF_SLAB_CLASSES||
+      268:  680:        dst < SLAB_GLOBAL_PAGE_POOL || dst > MAX_NUMBER_OF_SLAB_CLASSES)
+        -:  681:        return REASSIGN_BADCLASS;
+        -:  682:
+      267:  683:    if (slabs_page_count(src) < 2) {
+        -:  684:        return REASSIGN_NOSPARE;
+        -:  685:    }
+        -:  686:
+      259:  687:    t->rebal.s_clsid = src;
+      259:  688:    t->rebal.d_clsid = dst;
+      259:  689:    if (flags & SLABS_REASSIGN_ALLOW_EVICTIONS) {
+      109:  690:        t->allow_evictions = true;
+        -:  691:    }
+        -:  692:
+      259:  693:    pthread_cond_signal(&t->cond);
+        -:  694:
+      259:  695:    return REASSIGN_OK;
+        -:  696:}
+        -:  697:
+      125:  698:enum reassign_result_type slabs_reassign(struct slab_rebal_thread *t, int src, int dst, int flags) {
+      125:  699:    enum reassign_result_type ret;
+      125:  700:    if (pthread_mutex_trylock(&t->lock) != 0) {
+        -:  701:        return REASSIGN_RUNNING;
+        -:  702:    }
+      119:  703:    ret = do_slabs_reassign(t, src, dst, flags);
+      119:  704:    pthread_mutex_unlock(&t->lock);
+      119:  705:    return ret;
+        -:  706:}
+        -:  707:
+        -:  708:/* If we hold this lock, rebalancer can't wake up or move */
+        1:  709:void slab_maintenance_pause(struct slab_rebal_thread *t) {
+        1:  710:    pthread_mutex_lock(&t->lock);
+        1:  711:}
+        -:  712:
+        1:  713:void slab_maintenance_resume(struct slab_rebal_thread *t) {
+        1:  714:    pthread_mutex_unlock(&t->lock);
+        1:  715:}
+        -:  716:
+      115:  717:struct slab_rebal_thread *start_slab_maintenance_thread(void *storage) {
+      115:  718:    int ret;
+      115:  719:    struct slab_rebal_thread *t = calloc(1, sizeof(*t));
+      115:  720:    if (t == NULL)
+        -:  721:        return NULL;
+        -:  722:
+      115:  723:    pthread_mutex_init(&t->lock, NULL);
+      115:  724:    pthread_cond_init(&t->cond, NULL);
+      115:  725:    t->run_thread = true;
+      115:  726:    if (storage) {
+        -:  727:#ifdef EXTSTORE
+       12:  728:        t->storage = storage;
+       12:  729:        t->sam = &slab_automove_extstore;
+        -:  730:#endif
+        -:  731:    } else {
+      103:  732:        t->sam = &slab_automove_default;
+        -:  733:    }
+      115:  734:    t->active_am = t->sam->init(&settings);
+      115:  735:    if (t->active_am == NULL) {
+    #####:  736:        fprintf(stderr, "Can't create slab rebalancer thread: failed to allocate automover memory\n");
+    #####:  737:        return NULL;
+        -:  738:    }
+        -:  739:
+      115:  740:    if ((ret = pthread_create(&t->tid, NULL,
+        -:  741:                              slab_rebalance_thread, t)) != 0) {
+    #####:  742:        fprintf(stderr, "Can't create slab rebalancer thread: %s\n", strerror(ret));
+    #####:  743:        return NULL;
+        -:  744:    }
+      115:  745:    thread_setname(t->tid, "mc-slabmaint");
+      115:  746:    return t;
+        -:  747:}
+        -:  748:
+        -:  749:/* The maintenance thread is on a sleep/loop cycle, so it should join after a
+        -:  750: * short wait */
+        2:  751:void stop_slab_maintenance_thread(struct slab_rebal_thread *t) {
+        2:  752:    pthread_mutex_lock(&t->lock);
+        2:  753:    t->run_thread = false;
+        2:  754:    pthread_cond_signal(&t->cond);
+        2:  755:    pthread_mutex_unlock(&t->lock);
+        -:  756:
+        -:  757:    /* Wait for the maintenance thread to stop */
+        2:  758:    pthread_join(t->tid, NULL);
+        -:  759:
+        2:  760:    pthread_mutex_destroy(&t->lock);
+        2:  761:    pthread_cond_destroy(&t->cond);
+        2:  762:    if (t->rebal.completed) {
+    #####:  763:        free(t->rebal.completed);
+        -:  764:    }
+        2:  765:    t->sam->free(t->active_am);
+        2:  766:    free(t);
+        -:  767:
+        -:  768:    // TODO: there is no logger_destroy() yet.
+        2:  769:}
